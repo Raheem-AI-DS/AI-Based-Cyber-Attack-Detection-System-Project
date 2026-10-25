@@ -787,7 +787,7 @@ def _empty_fig(msg: str, height: int) -> go.Figure:
 
 
 def page_dashboard():
-    header("Network Intrusion Detection System",
+    header("AI Cyber Attack Detection System",
            "Live overview built from every Manual Analysis and Live Monitor result")
 
     df_all = history_df()
