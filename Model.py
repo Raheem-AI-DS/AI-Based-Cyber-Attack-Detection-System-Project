@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 import time
 import warnings
 from datetime import datetime
@@ -44,6 +45,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
@@ -478,11 +480,16 @@ def train_and_save(dataset_path: Path = DATASET_PATH, fast: bool = False, tune: 
         "confusion_matrix": {"labels": classes, "matrix": cm.tolist()},
         "per_class": classification_report(y_te, pred, labels=class_ids, target_names=classes, output_dict=True),
     }
-    artefact = {"classifier": classifier, "regressor": regressor, "iso": iso, "classes": classes, "report": report}
-    joblib.dump(artefact, MODEL_PATH, compress=3)
-    REPORT_PATH.write_text(json.dumps(report, indent=2, default=float))
-    _save_confusion_matrix(cm, classes)
-    log(f"\n[saved] {MODEL_PATH.name}, {REPORT_PATH.name}  (total {time.time() - t_start:.0f}s)")
+    report["sklearn_version"] = sklearn.__version__
+    artefact = {"classifier": classifier, "regressor": regressor, "iso": iso, "classes": classes, "report": report,
+                "sklearn_version": sklearn.__version__}
+    try:  # saving is best-effort: a read-only host (e.g. some cloud platforms) must not break training
+        joblib.dump(artefact, MODEL_PATH, compress=3)
+        REPORT_PATH.write_text(json.dumps(report, indent=2, default=float))
+        _save_confusion_matrix(cm, classes)
+        log(f"\n[saved] {MODEL_PATH.name}, {REPORT_PATH.name}  (total {time.time() - t_start:.0f}s)")
+    except Exception as exc:
+        log(f"\n[warning] could not write model files ({exc}); the model is kept in memory only")
     return artefact
 
 
@@ -514,17 +521,52 @@ def _save_confusion_matrix(cm, classes):
 # 4) Prediction API (used by app.py)
 # --------------------------------------------------------------------------
 _ARTEFACT = None
+_LOCK = threading.Lock()
+_STATUS = {"state": "not loaded", "detail": ""}
+
+
+def _try_load_saved():
+    """Load the saved model, but only if it was made by the SAME scikit-learn version.
+
+    A model file is a pickle: it breaks (for example "No module named '_loss'") when the library that
+    loads it differs from the one that created it. That is exactly what happens when a model trained on a
+    laptop is deployed to a cloud service with another scikit-learn version. In that case we return None
+    and the caller retrains inside the current environment.
+    """
+    if not MODEL_PATH.exists():
+        return None, "no saved model"
+    try:
+        art = joblib.load(MODEL_PATH)
+    except Exception as exc:
+        return None, f"saved model could not be loaded ({type(exc).__name__}: {exc})"
+    saved = art.get("sklearn_version") if isinstance(art, dict) else None
+    if saved != sklearn.__version__:
+        return None, f"saved model was built with scikit-learn {saved}, this environment has {sklearn.__version__}"
+    return art, "loaded saved model"
 
 
 def _load():
+    """Return the model, training a fresh one automatically when the saved file is missing or incompatible."""
     global _ARTEFACT
-    if _ARTEFACT is None:
-        if MODEL_PATH.exists():
-            _ARTEFACT = joblib.load(MODEL_PATH)
-        else:  # first run without a trained model: quick training so the app still works
-            print("[Model] No trained model found - running a quick training (python Model.py gives full quality).")
-            _ARTEFACT = train_and_save(fast=True, verbose=False)
+    if _ARTEFACT is not None:
+        return _ARTEFACT
+    with _LOCK:
+        if _ARTEFACT is not None:
+            return _ARTEFACT
+        art, why = _try_load_saved()
+        if art is None:
+            print(f"[Model] {why} -> training a fresh model for this environment (about 1-3 minutes) ...")
+            art = train_and_save(fast=True, verbose=False)
+            _STATUS.update(state="retrained", detail=why)
+        else:
+            _STATUS.update(state="loaded", detail=why)
+        _ARTEFACT = art
     return _ARTEFACT
+
+
+def model_status() -> dict:
+    """Small helper for the interface: how the model was obtained."""
+    return {**_STATUS, "sklearn_version": sklearn.__version__}
 
 
 def predict_attack(features: dict) -> dict:
