@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover
 # Page config
 # --------------------------------------------------------------------------
 st.set_page_config(
-    page_title="NIDS | AI Cyber Attack Detection",
+    page_title="AICD | AI Cyber Attack Detection",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -552,7 +552,7 @@ def build_pdf(res: dict, source: str, analyst: str) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
                             topMargin=16 * mm, bottomMargin=16 * mm,
-                            title="Cyber Attack Detection Report", author="NIDS")
+                            title="Cyber Attack Detection Report", author="AICD")
     ss = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=ss["Title"], textColor=colors.HexColor("#0b1b4d"), fontSize=20, spaceAfter=2)
     h2 = ParagraphStyle("h2", parent=ss["Heading2"], textColor=colors.HexColor("#1d3fae"), spaceBefore=10, spaceAfter=4)
@@ -760,7 +760,7 @@ def goto(page_name: str):
 NAV = ["📊  Dashboard", "🧪  Manual Analysis", "📡  Live Monitor", "🚨  Alerts", "📄  Reports", "⚙️  Settings"]
 
 with st.sidebar:
-    st.markdown("<div class='brand'><div class='logo'>🛡️</div><div><div class='name'>NIDS</div>"
+    st.markdown("<div class='brand'><div class='logo'>🛡️</div><div><div class='name'>AICD</div>"
                 "<div class='sub'>AI CYBER DEFENSE</div></div></div>", unsafe_allow_html=True)
     page = st.radio("Navigation", NAV, key="nav", label_visibility="collapsed")
     st.markdown(
