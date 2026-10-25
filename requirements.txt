@@ -3,4 +3,4 @@ plotly
 pandas
 numpy
 scikit-learn
-plotly
+reportlab
