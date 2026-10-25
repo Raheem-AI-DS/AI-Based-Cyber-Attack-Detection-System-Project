@@ -22,6 +22,7 @@ so the whole UI, live monitor and PDF report can be tested right now.
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import platform
 import random
@@ -45,7 +46,7 @@ except ImportError:  # pragma: no cover
 # Page config
 # --------------------------------------------------------------------------
 st.set_page_config(
-    page_title="AIDM | AI Cyber Attack Detection",
+    page_title="NIDS | AI Cyber Attack Detection",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -201,20 +202,48 @@ st.markdown(CSS, unsafe_allow_html=True)
 # --------------------------------------------------------------------------
 # Prediction engine (real model if available, otherwise demo engine)
 # --------------------------------------------------------------------------
-def _load_real_model():
-    """Try to import the trained model module created in the next step."""
+def _import_model_module():
+    """Import Model.py (or model.py) from the app folder."""
     for mod_name in ("Model", "model"):
         try:
             mod = __import__(mod_name)
             if hasattr(mod, "predict_attack"):
-                return mod.predict_attack
+                return mod
         except Exception:
             continue
     return None
 
 
-REAL_PREDICT = _load_real_model()
+_MODEL_MODULE = _import_model_module()
+
+
+@st.cache_resource(show_spinner="Preparing the AI model - the first start on a new server can take 1-3 minutes ...")
+def _warm_up_model():
+    """Load the saved model once per server process. If it was built with another scikit-learn version
+    (typical after deploying to a cloud service) Model.py retrains automatically instead of failing."""
+    if _MODEL_MODULE is None:
+        return "demo", "Model.py was not found next to app.py"
+    try:
+        _MODEL_MODULE._load()
+        return "ml", _MODEL_MODULE.model_status().get("detail", "")
+    except Exception as exc:
+        return "demo", f"{type(exc).__name__}: {exc}"
+
+
+_ENGINE_STATE, _ENGINE_NOTE = _warm_up_model()
+REAL_PREDICT = _MODEL_MODULE.predict_attack if (_MODEL_MODULE is not None and _ENGINE_STATE == "ml") else None
 MODEL_MODE = "ML Model" if REAL_PREDICT else "Demo Engine"
+
+
+def is_hosted() -> bool:
+    """True when the app is opened through a public/remote address (e.g. Streamlit Community Cloud)."""
+    try:
+        host = str(st.context.headers.get("Host", "")).lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    return not host.startswith(("localhost", "127.", "0.0.0.0", "[::1]", "192.168.", "10."))
 
 
 def posture_risk(f: dict) -> float:
@@ -264,8 +293,10 @@ def run_prediction(features: dict) -> dict:
     if REAL_PREDICT:
         try:
             out = REAL_PREDICT(features)
-        except Exception as exc:  # fall back, but tell the user
-            st.warning(f"Model error ({exc}). Falling back to demo engine.")
+        except Exception as exc:  # fall back, but tell the user (once per session)
+            if not st.session_state.get("_model_warned"):
+                st.session_state["_model_warned"] = True
+                st.warning(f"Model error ({exc}). Falling back to the demo engine.")
             out = _demo_predict(features)
     else:
         out = _demo_predict(features)
@@ -294,6 +325,8 @@ def _json_default(o):
 def load_history() -> list:
     """Reload earlier analyses so the dashboard survives an app restart."""
     out = []
+    if is_hosted():  # a hosted app is shared by many visitors: keep history per browser session only
+        return out
     try:
         if HISTORY_PATH.exists():
             for line in HISTORY_PATH.read_text(encoding="utf-8").splitlines()[-MAX_HISTORY:]:
@@ -309,6 +342,8 @@ def load_history() -> list:
 
 
 def save_result(res: dict):
+    if is_hosted():
+        return
     try:
         row = dict(res)
         row["timestamp"] = res["timestamp"].isoformat()
@@ -517,7 +552,7 @@ def build_pdf(res: dict, source: str, analyst: str) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
                             topMargin=16 * mm, bottomMargin=16 * mm,
-                            title="Cyber Attack Detection Report", author="AIDM")
+                            title="Cyber Attack Detection Report", author="NIDS")
     ss = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=ss["Title"], textColor=colors.HexColor("#0b1b4d"), fontSize=20, spaceAfter=2)
     h2 = ParagraphStyle("h2", parent=ss["Heading2"], textColor=colors.HexColor("#1d3fae"), spaceBefore=10, spaceAfter=4)
@@ -583,8 +618,26 @@ def build_pdf(res: dict, source: str, analyst: str) -> bytes:
 # --------------------------------------------------------------------------
 # Live system snapshot (Feature 2)
 # --------------------------------------------------------------------------
+SERVICE_BY_PORT = {80: "http", 8080: "http", 443: "https", 8443: "https", 22: "ssh", 21: "ftp",
+                   53: "dns", 25: "smtp", 587: "smtp", 23: "telnet", 445: "smb"}
+MIN_PACKETS = 20   # below this a scan window carries too little traffic to judge
+
+
+def _is_loopback(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_loopback
+    except ValueError:
+        return False
+
+
 def collect_system_features(interval: float) -> tuple[dict, dict]:
-    """Collect every parameter automatically from the local machine."""
+    """Collect every parameter automatically from the machine that runs the application.
+
+    The values are built to match what the model saw in training: only real network traffic counts
+    (loopback and listening sockets are ignored), "destination ports" are the service ports this machine
+    connects OUT to (never the random ports of visiting clients), and ratios are only used when there is
+    enough traffic for them to mean something.
+    """
     if psutil is None:
         raise RuntimeError("psutil is not installed. Run: pip install psutil")
     ss = st.session_state
@@ -608,46 +661,52 @@ def collect_system_features(interval: float) -> tuple[dict, dict]:
         pk = (io_now.packets_sent - p.packets_sent) + (io_now.packets_recv - p.packets_recv)
         errs = (io_now.errin + io_now.errout + io_now.dropin + io_now.dropout) - \
                (p.errin + p.errout + p.dropin + p.dropout)
+    sent, recv, pk, errs = max(sent, 0), max(recv, 0), max(pk, 0), max(errs, 0)
 
-    conns, remote_ips, remote_ports, listen_ports = [], set(), set(), set()
-    states = {"ESTABLISHED": 0, "SYN_RECV": 0, "SYN_SENT": 0, "TIME_WAIT": 0}
+    conns = []
     try:
-        conns = psutil.net_connections(kind="inet")
+        conns = psutil.net_connections(kind="tcp")
     except Exception:
-        pass  # needs admin rights on some OSes
-    for c in conns:
-        if c.status == "LISTEN":
-            listen_ports.add(c.laddr.port)
-        if c.raddr:
-            remote_ips.add(c.raddr.ip)
-            remote_ports.add(c.raddr.port)
+        pass  # needs admin rights on some systems / restricted on cloud containers
+    listening = {c.laddr.port for c in conns if c.status == "LISTEN" and c.laddr}
+    listen_open = {c.laddr.port for c in conns if c.status == "LISTEN" and c.laddr and not _is_loopback(c.laddr.ip)}
+    ext = [c for c in conns if c.raddr and c.status != "LISTEN" and not _is_loopback(c.raddr.ip)]
+    outbound = [c for c in ext if c.laddr and c.laddr.port not in listening]   # connections this machine opened
+    states = {"ESTABLISHED": 0, "SYN_RECV": 0, "SYN_SENT": 0, "TIME_WAIT": 0}
+    for c in ext:
         if c.status in states:
             states[c.status] += 1
-    n_conn = len(conns)
-    syn_rate = (states["SYN_RECV"] + states["SYN_SENT"]) / max(n_conn, 1)
+    remote_ips = {c.raddr.ip for c in ext}
+    out_ports = [c.raddr.port for c in outbound]
+    local_ports = sorted(c.laddr.port for c in outbound if c.laddr)
+    n_ext = len(ext)
+    syn_rate = (states["SYN_RECV"] + states["SYN_SENT"]) / n_ext if n_ext >= 5 else 0.0
+    dst_port = max(set(out_ports), key=out_ports.count) if out_ports else 443
+    src_port = local_ports[len(local_ports) // 2] if local_ports else 49152
+    err_rate = min(errs / pk, 1.0) if pk >= 50 else 0.0   # a ratio of a handful of packets is just noise
     cfg = ss.settings
 
     feats = {
         "duration": round(dt, 2),
         "protocol_type": "tcp",
-        "service": "other",
+        "service": SERVICE_BY_PORT.get(dst_port, "other"),
         "flag": "S0" if syn_rate > 0.3 else "SF",
         "src_bytes": int(sent),
         "dst_bytes": int(recv),
         "packet_count": int(pk),
         "packets_per_sec": round(pk / dt, 1),
-        "src_port": 0,
-        "dst_port": 0,
-        "unique_dst_ports": len(remote_ports),
-        "unique_dst_ips": len(remote_ips),
-        "conn_count": n_conn,
+        "src_port": int(src_port),
+        "dst_port": int(dst_port),
+        "unique_dst_ports": max(len(set(out_ports)), 1),
+        "unique_dst_ips": max(len(remote_ips), 1),
+        "conn_count": max(n_ext, 1),
         "syn_error_rate": round(syn_rate, 3),
-        "error_rate": round(errs / max(pk, 1), 4),
+        "error_rate": round(err_rate, 4),
         "failed_logins": 0,  # OS auth logs need elevated, OS-specific access
         "login_attempts": 0,
         "payload_sql_tokens": 0,
         "payload_script_tokens": 0,
-        "open_ports": len(listen_ports),
+        "open_ports": len(listen_open),
         "outdated_software": cfg["outdated_software"],
         "firewall_enabled": cfg["firewall_enabled"],
         "mfa_enabled": cfg["mfa_enabled"],
@@ -659,11 +718,24 @@ def collect_system_features(interval: float) -> tuple[dict, dict]:
         "disk": psutil.disk_usage("/").percent if platform.system() != "Windows" else psutil.disk_usage("C:\\").percent,
         "net_kbps": (sent + recv) / dt / 1024,
         "procs": len(psutil.pids()),
-        "listen": len(listen_ports),
+        "listen": len(listen_open),
         "established": states["ESTABLISHED"],
         "remote_ips": len(remote_ips),
+        "packets": int(pk),
     }
     return feats, sysinfo
+
+
+def apply_idle_guard(res: dict, feats: dict) -> dict:
+    """A scan window with almost no traffic cannot be judged reliably - report it as Normal (idle)."""
+    if feats["packet_count"] < MIN_PACKETS and feats["syn_error_rate"] < 0.3 and res["attack_type"] != "Normal":
+        raw = res["attack_type"]
+        res["raw_model_class"] = raw
+        res["attack_type"] = "Normal"
+        res["confidence"] = float(res["probabilities"].get("Normal", 0.0))
+        res["note"] = (f"Only {feats['packet_count']} packets were seen in this scan window, which is too little traffic "
+                       f"to judge reliably, so it is reported as Normal (idle). Raw model output was: {raw}.")
+    return res
 
 
 def local_ip() -> str:
@@ -688,7 +760,7 @@ def goto(page_name: str):
 NAV = ["📊  Dashboard", "🧪  Manual Analysis", "📡  Live Monitor", "🚨  Alerts", "📄  Reports", "⚙️  Settings"]
 
 with st.sidebar:
-    st.markdown("<div class='brand'><div class='logo'>🛡️</div><div><div class='name'>Threat Sense</div>"
+    st.markdown("<div class='brand'><div class='logo'>🛡️</div><div><div class='name'>NIDS</div>"
                 "<div class='sub'>AI CYBER DEFENSE</div></div></div>", unsafe_allow_html=True)
     page = st.radio("Navigation", NAV, key="nav", label_visibility="collapsed")
     st.markdown(
@@ -916,6 +988,11 @@ def page_live():
     if psutil is None:
         st.error("`psutil` is required for live monitoring. Install it with `pip install psutil`.")
         return
+    if is_hosted():
+        st.warning("This application is running on a **remote server**. The Live Monitor measures the machine that "
+                   "runs the app (the server), **not your own computer**, and a quiet server will mostly look normal. "
+                   "To monitor your own PC, run the app locally with `streamlit run app.py`. "
+                   "Use **Manual Analysis** for any online demonstration.")
 
     c1, c2, c3 = st.columns([1, 1, 2])
     auto = c1.toggle("Auto-refresh", value=False, key="live_auto")
@@ -928,7 +1005,7 @@ def page_live():
         except Exception as exc:
             st.error(f"Could not collect system data: {exc}")
             return
-        res = run_prediction(feats)
+        res = apply_idle_guard(run_prediction(feats), feats)
         record_result(res, f"Live monitor ({socket.gethostname()})", "multiple remote hosts", local_ip())
         st.session_state.live_log.append({
             "t": res["timestamp"], "risk": res["risk_score"], "kbps": info["net_kbps"], "cpu": info["cpu"]})
@@ -972,6 +1049,8 @@ def page_live():
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.write("")
+    if res.get("note"):
+        st.info(res["note"])
     result_panel(res)
     with st.expander("🔬 Collected feature vector (sent to the model)"):
         st.dataframe(pd.DataFrame([feats]).T.rename(columns={0: "value"}).astype(str), width="stretch")
@@ -1044,7 +1123,9 @@ def page_settings():
         st.form_submit_button("💾  Save settings")
     st.markdown(f"<div class='card'><b>Prediction engine:</b> {MODEL_MODE}<br>"
                 f"<span style='color:#8892ad'>Place <code>Model.py</code> with <code>predict_attack(features)</code> "
-                f"next to <code>app.py</code> to switch from the demo engine to the trained ML model.</span></div>",
+                f"next to <code>app.py</code> to switch from the demo engine to the trained ML model."
+                f"{'<br>Engine note: ' + escape(str(_ENGINE_NOTE)) if _ENGINE_NOTE else ''}"
+                f"{'<br>Hosted deployment: history is kept for this browser session only.' if is_hosted() else ''}</span></div>",
                 unsafe_allow_html=True)
     if st.button("🗑️  Clear analysis history"):
         ss = st.session_state
